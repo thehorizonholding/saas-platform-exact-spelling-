@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRANCH="feat/domain-https-observability"
+TITLE="feat(aws): custom domain + HTTPS and observability"
+BODY=$'Enable ACM+Route53 HTTPS on a custom domain (per environment), keep HTTP fallback when no domain set, initialize Sentry (client/server) and optional OpenTelemetry exporter, and update deploy workflow to pass domain context to the CDK stack.'
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+
+need git
+need gh
+
+# Ensure we are in a git repo
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Run this from your repository root."; exit 1; }
+
+# Ensure branch exists locally from main
+git fetch origin
+if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+  git checkout "$BRANCH"
+else
+  # Fallback to main if present
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    git checkout -B "$BRANCH" origin/main
+  else
+    git checkout -B "$BRANCH"
+  fi
+fi
+
+mkdir -p infra/cdk/src infra/cdk/bin .github/workflows
+
+# 1) CDK stack with domain/HTTPS and observability-ready env passthrough
+cat > infra/cdk/src/saas-platform-stack.ts <<'TS'
+import {
+  Stack,
+  StackProps,
+  CfnOutput,
+  RemovalPolicy,
+} from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ecs_patterns from 'aws-cdk-lib/aws-ecs-patterns';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as certificatemanager from 'aws-cdk-lib/aws-certificatemanager';
+import { ApplicationProtocol } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+
+interface Props extends StackProps {
+  stage: string;
+  domain?: string;           // e.g., app-staging.example.com
+  hostedZoneName?: string;   // e.g., example.com
+  hostedZoneId?: string;     // optional, to avoid lookup
+}
+
+function getRootDomainFromFqdn(fqdn: string | undefined): string | undefined {
+  if (!fqdn) return undefined;
+  const parts = fqdn.split('.');
+  if (parts.length < 2) return undefined;
+  return parts.slice(-2).join('.');
+}
+
+export class SaasPlatformStack extends Stack {
+  constructor(scope: Construct, id: string, props: Props) {
+    super(scope, id, props);
+
+    const { stage, domain, hostedZoneName, hostedZoneId } = props;
+
+    // Networking
+    const vpc = new ec2.Vpc(this, 'Vpc', {
+      maxAzs: 2,
+      natGateways: 1,
+    });
+
+    // ECR repository reference (must exist)
+    const repoName = process.env.ECR_REPOSITORY || 'saas-platform-app';
+    const repository = ecr.Repository.fromRepositoryName(this, 'AppRepo', repoName);
+
+    // ECS Cluster
+    const cluster = new ecs.Cluster(this, 'Cluster', {
+      vpc,
+      containerInsights: true,
+    });
+
+    // RDS Postgres
+    const dbCredentials = rds.Credentials.fromGeneratedSecret('postgres');
+    const db = new rds.DatabaseInstance(this, 'Postgres', {
+      engine: rds.DatabaseInstanceEngine.postgres({ version: rds.PostgresEngineVersion.V16 }),
+      vpc,
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
+      multiAz: false,
+      allocatedStorage: 20,
+      storageEncrypted: true,
+      credentials: dbCredentials,
+      removalPolicy: RemovalPolicy.DESTROY, // change to RETAIN for prod durability
+      deletionProtection: stage === 'production',
+      publiclyAccessible: false,
+    });
+    const dbSecret = db.secret!;
+
+    // App runtime secret for DATABASE_URL (populated post-provision)
+    const dbUrl = new secretsmanager.Secret(this, 'DatabaseUrl', {
+      secretName: `/saas/${stage}/DATABASE_URL`,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ placeholder: true }),
+        generateStringKey: 'DATABASE_URL',
+      },
+    });
+
+    // Roles
+    const taskRole = new iam.Role(this, 'TaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    dbSecret.grantRead(taskRole);
+    dbUrl.grantRead(taskRole);
+
+    const executionRole = new iam.Role(this, 'ExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
+      ],
+    });
+
+    // Optional domain/HTTPS setup
+    let certificate: certificatemanager.ICertificate | undefined;
+    let zone: route53.IHostedZone | undefined;
+
+    if (domain) {
+      const rootDomain = hostedZoneName || getRootDomainFromFqdn(domain);
+      if (hostedZoneId && rootDomain) {
+        zone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+          hostedZoneId,
+          zoneName: rootDomain,
+        });
+      } else if (rootDomain) {
+        // Lookup existing hosted zone in Route53 by name
+        zone = route53.HostedZone.fromLookup(this, 'HostedZone', {
+          domainName: rootDomain,
+        });
+      }
+
+      if (zone) {
+        certificate = new certificatemanager.DnsValidatedCertificate(this, 'ALBCert', {
+          domainName: domain,
+          hostedZone: zone,
+          region: Stack.of(this).region, // ALB is regional
+        });
+      }
+    }
+
+    const imageTag = process.env.IMAGE_TAG || 'latest';
+
+    // Fargate service + ALB
+    const fargate = new ecs_patterns.ApplicationLoadBalancedFargateService(this, 'Service', {
+      cluster,
+      cpu: 512,
+      desiredCount: 1,
+      memoryLimitMiB: 1024,
+      publicLoadBalancer: true,
+      protocol: certificate ? ApplicationProtocol.HTTPS : ApplicationProtocol.HTTP,
+      certificate: certificate,
+      redirectHTTP: !!certificate, // redirect 80 -> 443 when HTTPS is configured
+      domainName: certificate && zone ? domain : undefined,
+      domainZone: certificate && zone ? zone : undefined,
+      taskImageOptions: {
+        image: ecs.ContainerImage.fromEcrRepository(repository, imageTag),
+        containerPort: 3000,
+        enableLogging: true,
+        taskRole,
+        executionRole,
+        environment: {
+          NODE_ENV: stage === 'production' ? 'production' : 'staging',
+          PORT: '3000',
+          // Optional observability envs can be passed through GitHub env secrets at build/deploy time
+          // SENTRY_DSN, OTEL_EXPORTER_OTLP_ENDPOINT
+        },
+        secrets: {
+          DATABASE_URL: ecs.Secret.fromSecretsManager(dbUrl, 'DATABASE_URL'),
+        },
+      },
+    });
+
+    // Allow ECS to reach DB
+    db.connections.allowDefaultPortFrom(fargate.service);
+
+    new CfnOutput(this, 'LoadBalancerDNS', {
+      value: fargate.loadBalancer.loadBalancerDnsName,
+    });
+    if (domain && certificate && zone) {
+      new CfnOutput(this, 'CustomDomain', { value: `https://${domain}` });
+    }
+  }
+}
+TS
+
+# 2) CDK bin to pass DOMAIN/HOSTED_ZONE_* via context or env
+cat > infra/cdk/bin/app.ts <<'TS'
+#!/usr/bin/env node
+import 'source-map-support/register';
+import { App, Tags } from 'aws-cdk-lib';
+import { SaasPlatformStack } from '../src/saas-platform-stack.js';
+
+const app = new App();
+
+const stage = process.env.STAGE ?? app.node.tryGetContext('stage') ?? 'staging';
+const domain = process.env.DOMAIN ?? app.node.tryGetContext('domain') ?? undefined;
+const hostedZoneName = process.env.HOSTED_ZONE_NAME ?? app.node.tryGetContext('hostedZoneName') ?? undefined;
+const hostedZoneId = process.env.HOSTED_ZONE_ID ?? app.node.tryGetContext('hostedZoneId') ?? undefined;
+
+new SaasPlatformStack(app, `SaasPlatform-${stage}`, {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION,
+  },
+  stage,
+  domain,
+  hostedZoneName,
+  hostedZoneId,
+});
+
+Tags.of(app).add('App', 'saas-platform-exact-spelling-');
+Tags.of(app).add('Stage', stage);
+
+app.synth();
+TS
+
+# 3) Deploy workflow updated to pass domain/zone context and run migrations
+cat > .github/workflows/deploy-aws.yml <<'YML'
+name: Deploy AWS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Stage to deploy (staging|production)"
+        type: choice
+        required: true
+        options: [staging, production]
+        default: staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.stage) || 'staging' }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      STAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.stage) || 'staging' }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      DOMAIN: ${{ vars.DOMAIN }}
+      HOSTED_ZONE_NAME: ${{ vars.HOSTED_ZONE_NAME }}
+      HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: vars_step
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::12}" >> $GITHUB_OUTPUT
+          echo "ECR_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push image
+        run: |
+          docker build -t ${{ steps.vars_step.outputs.ECR_URI }}:${{ steps.vars_step.outputs.IMAGE_TAG }} .
+          docker push ${{ steps.vars_step.outputs.ECR_URI }}:${{ steps.vars_step.outputs.IMAGE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install CDK
+        run: npm -g i aws-cdk@2
+
+      - name: Install infra deps
+        working-directory: infra/cdk
+        run: npm ci
+
+      - name: Synthesize
+        working-directory: infra/cdk
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ env.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          STAGE: ${{ env.STAGE }}
+          IMAGE_TAG: ${{ steps.vars_step.outputs.IMAGE_TAG }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          DOMAIN: ${{ env.DOMAIN }}
+          HOSTED_ZONE_NAME: ${{ env.HOSTED_ZONE_NAME }}
+          HOSTED_ZONE_ID: ${{ env.HOSTED_ZONE_ID }}
+        run: npm run build && npx cdk synth -c stage=${{ env.STAGE }} -c domain=${{ env.DOMAIN }} -c hostedZoneName=${{ env.HOSTED_ZONE_NAME }} -c hostedZoneId=${{ env.HOSTED_ZONE_ID }}
+
+      - name: Deploy
+        working-directory: infra/cdk
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ env.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          STAGE: ${{ env.STAGE }}
+          IMAGE_TAG: ${{ steps.vars_step.outputs.IMAGE_TAG }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          DOMAIN: ${{ env.DOMAIN }}
+          HOSTED_ZONE_NAME: ${{ env.HOSTED_ZONE_NAME }}
+          HOSTED_ZONE_ID: ${{ env.HOSTED_ZONE_ID }}
+        run: npx cdk deploy --require-approval never -c stage=${{ env.STAGE }} -c domain=${{ env.DOMAIN }} -c hostedZoneName=${{ env.HOSTED_ZONE_NAME }} -c hostedZoneId=${{ env.HOSTED_ZONE_ID }}
+
+      - name: Run DB migrations in ECS one-off task
+        shell: bash
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          CLUSTER_ARN=$(aws ecs list-clusters --query 'clusterArns[0]' --output text --region "$AWS_REGION")
+          SERVICE_ARN=$(aws ecs list-services --cluster "$CLUSTER_ARN" --query 'serviceArns[0]' --output text --region "$AWS_REGION")
+          TASK_DEF=$(aws ecs describe-services --cluster "$CLUSTER_ARN" --services "$SERVICE_ARN" --query 'services[0].taskDefinition' --output text --region "$AWS_REGION")
+          SUBNETS=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=false --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId' --output text --region "$AWS_REGION" | tr '\t' ',')
+          aws ecs run-task \
+            --cluster "$CLUSTER_ARN" \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={assignPublicIp=DISABLED,subnets=${SUBNETS}}" \
+            --overrides '{"containerOverrides":[{"name":"Service","command":["sh","-lc","pnpm prisma:deploy"]}]}' \
+            --region "$AWS_REGION"
+YML
+
+# 4) OpenTelemetry instrumentation (optional activation via env)
+cat > instrumentation.ts <<'TS'
+import { diag, DiagConsoleLogger, DiagLogLevel } from '@opentelemetry/api';
+
+if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
+  import('@opentelemetry/sdk-node').then(async ({ NodeSDK }) => {
+    const { getNodeAutoInstrumentations } = await import('@opentelemetry/auto-instrumentations-node');
+    const { OTLPTraceExporter } = await import('@opentelemetry/exporter-trace-otlp-http');
+    const { Resource } = await import('@opentelemetry/resources');
+    const { SemanticResourceAttributes } = await import('@opentelemetry/semantic-conventions');
+
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.ERROR);
+
+    const exporter = new OTLPTraceExporter({
+      url: `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT.replace(/\/$/, '')}/v1/traces`,
+      headers: {},
+    });
+
+    const resource = new Resource({
+      [SemanticResourceAttributes.SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || 'saas-platform-app',
+      [SemanticResourceAttributes.DEPLOYMENT_ENVIRONMENT]: process.env.NODE_ENV || 'production',
+    });
+
+    const sdk = new NodeSDK({
+      traceExporter: exporter,
+      resource,
+      instrumentations: [getNodeAutoInstrumentations()],
+    });
+
+    sdk.start().catch((err) => {
+      console.error('Failed to start OpenTelemetry SDK', err);
+    });
+
+    process.on('SIGTERM', () => {
+      sdk.shutdown().catch(() => {}).finally(() => process.exit(0));
+    });
+  }).catch((e) => {
+    console.error('OTel init error', e);
+  });
+}
+
+export async function register() {
+  // Hook called by Next.js at startup (server)
+}
+TS
+
+# 5) Sentry client/server configs (init only if DSN present)
+cat > sentry.server.config.ts <<'TS'
+import * as Sentry from '@sentry/nextjs';
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? '0.1'),
+    environment: process.env.NODE_ENV === 'production' ? 'production' : 'staging',
+  });
+}
+TS
+
+cat > sentry.client.config.ts <<'TS'
+import * as Sentry from '@sentry/nextjs';
+
+if (process.env.NEXT_PUBLIC_SENTRY_DSN || process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.NEXT_PUBLIC_SENTRY_DSN || process.env.SENTRY_DSN,
+    tracesSampleRate: Number(process.env.NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE ?? process.env.SENTRY_TRACES_SAMPLE_RATE ?? '0.1'),
+    environment: process.env.NODE_ENV === 'production' ? 'production' : 'staging',
+  });
+}
+TS
+
+# 6) Update package.json (backup then overwrite with expected deps/scripts)
+if [ -f package.json ]; then
+  cp package.json package.json.bak
+fi
+
+cat > package.json <<'JSON'
+{
+  "name": "saas-platform-exact-spelling",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "seed": "tsx prisma/seed.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write .",
+    "prepare": "husky install",
+    "ci": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-node": "^0.53.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.53.0",
+    "@prisma/client": "^5.19.0",
+    "bcryptjs": "^2.4.3",
+    "next": "15.0.0",
+    "next-auth": "^5.0.0-beta.25",
+    "pino": "^9.2.0",
+    "pino-pretty": "^11.2.2",
+    "prisma": "^5.19.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "stripe": "^16.0.0",
+    "zod": "^3.23.8",
+    "@sentry/nextjs": "^8.25.0"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.5.0",
+    "@commitlint/config-conventional": "^19.5.0",
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.2.45",
+    "@types/react-dom": "^18.2.18",
+    "eslint": "^9.6.0",
+    "eslint-config-next": "15.0.0",
+    "prettier": "^3.3.3",
+    "tsx": "^4.15.7",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "@vitest/coverage-v8": "^2.0.5"
+  }
+}
+JSON
+
+# Commit and push
+git add infra/cdk/src/saas-platform-stack.ts infra/cdk/bin/app.ts .github/workflows/deploy-aws.yml instrumentation.ts sentry.server.config.ts sentry.client.config.ts package.json
+if git diff --cached --quiet; then
+  echo "No changes to commit on $BRANCH"
+else
+  git commit -m "$TITLE"
+fi
+
+git push -u origin "$BRANCH"
+
+# Create PR
+if gh pr view "$BRANCH" >/dev/null 2>&1; then
+  echo "PR already exists for $BRANCH"
+else
+  gh pr create --title "$TITLE" --body "$BODY" || {
+    echo "Failed to open PR via gh. You can open it here:"
+    echo "https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/compare/$BRANCH?expand=1"
+  }
+fi
+
+echo "Done. Review the PR and merge when ready."
