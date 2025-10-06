@@ -1,0 +1,72 @@
+mod connectors;
+
+use axum::{routing::get, routing::post, Json, Router, http::StatusCode};
+use connectors::example_provider::ExampleProvider;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PayoutRequest {
+    idempotency_key: String,
+    amount: i64,              // minor units
+    currency: String,         // e.g., "USD"
+    destination_iban: String, // placeholder; US rails: account/routing
+    recipient_name: String,
+    reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PayoutResponse {
+    request_id: Uuid,
+    provider_tx_id: Option<String>,
+    status: String, // initiated|failed
+}
+
+#[tokio::main]
+async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).compact().init();
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))) }))
+        .route("/v1/payouts", post(create_payout));
+
+    let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8081);
+    let addr = std::net::SocketAddr::from(([0,0,0,0], port));
+    info!("payments-gateway listening on {}", addr);
+    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+}
+
+async fn create_payout(Json(req): Json<PayoutRequest>) -> (StatusCode, Json<PayoutResponse>) {
+    let connector = ExampleProvider::default();
+    match connector
+        .create_payout(
+            &req.idempotency_key,
+            req.amount,
+            &req.currency,
+            &req.destination_iban,
+            &req.recipient_name,
+            req.reference.as_deref(),
+        )
+        .await
+    {
+        Ok(provider_tx_id) => (
+            StatusCode::OK,
+            Json(PayoutResponse {
+                request_id: Uuid::new_v4(),
+                provider_tx_id,
+                status: "initiated".into(),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(PayoutResponse {
+                request_id: Uuid::new_v4(),
+                provider_tx_id: None,
+                status: format!("failed: {}", e),
+            }),
+        ),
+    }
+}
