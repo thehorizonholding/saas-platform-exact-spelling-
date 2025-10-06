@@ -1,0 +1,15 @@
+# Licensing & Partnerships
+
+To connect to SWIFT in production, either:
+- Become a direct SWIFT participant (BIC, rigorous audits), or
+- Integrate via a sponsor bank and/or SWIFT service bureau.
+
+## Typical Paths
+- US: Money transmitter licenses per-state or partner with a licensed MSB, plus sponsor bank/BaaS (e.g., Evolve, Cross River, Stripe Treasury, Unit).
+- EU/UK: EMI or PI via local regulator (e.g., FCA), or operate under an EMI’s agency model.
+
+## Must-Haves
+- AML program, MLRO, transaction monitoring, sanctions screening.
+- KYC/KYB, data retention, auditability.
+- InfoSec controls (SOC2/ISO27001), incident response.
+- Transparent ToS/Privacy policies and customer support processes.

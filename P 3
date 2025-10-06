@@ -1,0 +1,19 @@
+[package]
+name = "payments-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Payments gateway abstraction (fiat rails, providers, payouts)"
+authors = ["thehorizonholding <security@thehorizonholding.example>"]
+
+[dependencies]
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+async-trait = "0.1"
+anyhow = "1.0"

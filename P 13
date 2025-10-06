@@ -1,0 +1,24 @@
+# Payments + SWIFT-like Architecture (Phased)
+
+This outlines a practical path to a PayPal-like payments stack with SWIFT connectivity via a sponsor bank or service bureau.
+
+## Phase 0 — Compliance Foundation
+- Licensing path (EMI/PI in EU/UK; MTL + sponsor bank/BaaS in US).
+- KYC/AML, sanctions screening, transaction monitoring.
+- Policies: AML program, disputes/chargebacks, data retention, privacy, incident response.
+- Security: key management, secrets, encryption, audit logging.
+
+## Phase 1 — Internal Rails
+- Ledger (services/ledger): double-entry, idempotent postings.
+- Custody: crypto wallets (or custodian), fiat accounts with partner bank.
+- Reconciliation: camt.053 bank statements and on-chain deltas to ledger.
+
+## Phase 2 — Fiat In/Out
+- Payments gateway (services/payments-gateway): provider connectors for ACH/SEPA/wires/cards.
+- SWIFT adapter (services/swift-adapter): build ISO 20022 messages (pain.001) for bank/service-bureau submission and ACK/NACK flow.
+
+## Phase 3 — Exchange
+- Matching engine (services/exchange-engine), market data, KYC-gated access, custody/settlement bridged to ledger.
+
+## Phase 4 — Risk/Treasury
+- Liquidity mgmt, exposure limits, automated reconciliation, alerts, fraud/chargebacks.

@@ -1,0 +1,33 @@
+name: payments-suite CI
+
+on:
+  push:
+    paths:
+      - "services/ledger/**"
+      - "services/payments-gateway/**"
+      - "services/swift-adapter/**"
+      - "services/exchange-engine/**"
+      - ".github/workflows/payments-suite-ci.yml"
+  pull_request:
+    paths:
+      - "services/ledger/**"
+      - "services/payments-gateway/**"
+      - "services/swift-adapter/**"
+      - "services/exchange-engine/**"
+      - ".github/workflows/payments-suite-ci.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pkg: [ "services/ledger", "services/payments-gateway", "services/swift-adapter", "services/exchange-engine" ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.70.0
+      - name: Build ${{ matrix.pkg }}
+        run: |
+          cd ${{ matrix.pkg }}
+          cargo build --release
