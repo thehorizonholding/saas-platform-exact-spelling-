@@ -1,0 +1,83 @@
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::writer::Writer;
+use std::io::Cursor;
+
+// Simplified pain.001 (demo only)
+pub fn build_pain_001_xml(
+    msg_id: &str,
+    debtor_name: &str,
+    debtor_iban: &str,
+    creditor_name: &str,
+    creditor_iban: &str,
+    amount: &str,   // "123.45"
+    currency: &str, // "USD"
+    end_to_end_id: &str,
+) -> String {
+    let mut writer = Writer::new(Cursor::new(Vec::new()));
+
+    let mut doc = BytesStart::new("Document");
+    doc.push_attribute(("xmlns", "urn:iso:std:iso:20022:tech:xsd:pain.001.001.03"));
+    writer.write_event(Event::Start(doc)).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("CstmrCdtTrfInitn"))).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("GrpHdr"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("MsgId"))).ok();
+    writer.write_event(Event::Text(msg_id.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("MsgId").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("GrpHdr").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("PmtInf"))).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("Dbtr"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("Nm"))).ok();
+    writer.write_event(Event::Text(debtor_name.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("Nm").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Dbtr").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("DbtrAcct"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("Id"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("IBAN"))).ok();
+    writer.write_event(Event::Text(debtor_iban.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("IBAN").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Id").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("DbtrAcct").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("CdtTrfTxInf"))).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("Amt"))).ok();
+    let mut instd_amt = BytesStart::new("InstdAmt");
+    instd_amt.push_attribute(("Ccy", currency));
+    writer.write_event(Event::Start(instd_amt)).ok();
+    writer.write_event(Event::Text(amount.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("InstdAmt").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Amt").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("Cdtr"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("Nm"))).ok();
+    writer.write_event(Event::Text(creditor_name.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("Nm").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Cdtr").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("CdtrAcct"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("Id"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("IBAN"))).ok();
+    writer.write_event(Event::Text(creditor_iban.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("IBAN").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Id").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("CdtrAcct").to_end())).ok();
+
+    writer.write_event(Event::Start(BytesStart::new("RmtInf"))).ok();
+    writer.write_event(Event::Start(BytesStart::new("Ustrd"))).ok();
+    writer.write_event(Event::Text(end_to_end_id.into())).ok();
+    writer.write_event(Event::End(BytesStart::new("Ustrd").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("RmtInf").to_end())).ok();
+
+    writer.write_event(Event::End(BytesStart::new("CdtTrfTxInf").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("PmtInf").to_end())).ok();
+
+    writer.write_event(Event::End(BytesStart::new("CstmrCdtTrfInitn").to_end())).ok();
+    writer.write_event(Event::End(BytesStart::new("Document").to_end())).ok();
+
+    String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default()
+}
