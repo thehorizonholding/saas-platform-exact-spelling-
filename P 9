@@ -1,0 +1,47 @@
+mod iso20022;
+
+use axum::{routing::get, routing::post, Json, Router, http::StatusCode};
+use serde::Deserialize;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
+
+#[derive(Debug, Deserialize)]
+struct PaymentInstruction {
+    msg_id: String,
+    debtor_name: String,
+    debtor_iban: String,
+    creditor_name: String,
+    creditor_iban: String,
+    amount: String,   // "123.45"
+    currency: String, // "USD"
+    end_to_end_id: String,
+}
+
+#[tokio::main]
+async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).compact().init();
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))) }))
+        .route("/v1/pain001", post(pain001));
+
+    let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8082);
+    let addr = std::net::SocketAddr::from(([0,0,0,0], port));
+    info!("swift-adapter listening on {}", addr);
+    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+}
+
+async fn pain001(Json(pi): Json<PaymentInstruction>) -> (StatusCode, String) {
+    let xml = iso20022::build_pain_001_xml(
+        &pi.msg_id,
+        &pi.debtor_name,
+        &pi.debtor_iban,
+        &pi.creditor_name,
+        &pi.creditor_iban,
+        &pi.amount,
+        &pi.currency,
+        &pi.end_to_end_id,
+    );
+    (StatusCode::OK, xml)
+}
