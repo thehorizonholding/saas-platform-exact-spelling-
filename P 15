@@ -1,0 +1,13 @@
+# Exchange Architecture (Minimal)
+
+## Components
+- Matching Engine (services/exchange-engine): limit order book with REST API.
+- Market Data: publish top-of-book/trades (websockets later).
+- Settlement: integrate fills with Ledger; batch to custodians/banks.
+- Risk: per-account limits, pre-trade checks, reconciliation.
+
+## Roadmap
+- Persist engine with per-order queues and FIFO.
+- Add websockets and FIX gateway (optional).
+- Add funding/withdrawal with KYC + sanctions checks.
+- Fees: maker/taker schedules, referrals.
