@@ -1,0 +1,28 @@
+bash -lc '
+set -euo pipefail
+REPO="thehorizonholding/HorizCoin"
+BR="feat/payments-exchange-scaffolding"
+
+# Clone or enter repo
+if [ ! -d HorizCoin ]; then gh repo clone "$REPO"; fi
+cd HorizCoin
+
+# Ensure up-to-date main, create unique feature branch
+git fetch origin --prune
+git checkout -B main origin/main
+if git ls-remote --heads origin "$BR" | grep -q "$BR"; then
+  BR="feat/payments-exchange-scaffolding-$(date +%Y%m%d-%H%M%S)"
+fi
+git checkout -b "$BR"
+
+# Add the files you copied from this message into the repo paths, then:
+git add services/ledger services/payments-gateway services/swift-adapter services/exchange-engine docs/payments docs/compliance docs/exchange .github/workflows/payments-suite-ci.yml
+git commit -m "feat(payments): ledger, payments-gateway, swift-adapter, exchange-engine scaffolding + CI and docs"
+git push -u origin "$BR"
+
+# Open PR
+gh pr create \
+  --title "feat(payments): ledger, payments-gateway, swift-adapter, exchange-engine scaffolding" \
+  --body "Adds foundational payments + exchange scaffolding:\n- services/ledger: double-entry ledger with idempotent postings\n- services/payments-gateway: connector-based fiat rails abstraction\n- services/swift-adapter: ISO 20022 pain.001 generator for bank/service-bureau integration\n- services/exchange-engine: minimal matching engine\n- docs: payments/SWIFT and exchange architecture, licensing checklist\n- CI: builds all services independently on Rust 1.70.0" \
+  --base main --head "$BR" -R "$REPO"
+'
