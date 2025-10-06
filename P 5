@@ -1,0 +1,22 @@
+use super::PayoutConnector;
+use async_trait::async_trait;
+use uuid::Uuid;
+
+#[derive(Default)]
+pub struct ExampleProvider;
+
+#[async_trait]
+impl PayoutConnector for ExampleProvider {
+    async fn create_payout(
+        &self,
+        _idempotency_key: &str,
+        _amount: i64,
+        _currency: &str,
+        _destination_iban: &str,
+        _recipient_name: &str,
+        _reference: Option<&str>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        // Replace with real provider integration (e.g., Wise, Currencycloud, Stripe Treasury, bank API).
+        Ok(Some(format!("stub-tx-{}", Uuid::new_v4())))
+    }
+}
