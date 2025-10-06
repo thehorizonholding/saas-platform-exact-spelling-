@@ -1,0 +1,118 @@
+use axum::{routing::get, routing::post, Json, Router, http::StatusCode};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, net::SocketAddr, sync::{Arc, RwLock}};
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Side { Buy, Sell }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderRequest {
+    idempotency_key: String,
+    symbol: String, // e.g., "HORIZ-USD"
+    side: Side,
+    price: i64,     // price in minor units
+    qty: i64,       // quantity in base units
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderAck {
+    order_id: Uuid,
+    status: String, // accepted|filled|partial
+}
+
+#[derive(Default)]
+struct BookLevel { qty: i64 }
+
+#[derive(Default)]
+struct OrderBook {
+    bids: BTreeMap<i64, BookLevel>, // high->low (reverse iterate)
+    asks: BTreeMap<i64, BookLevel>, // low->high
+}
+
+#[derive(Default)]
+struct State {
+    books: std::collections::HashMap<String, OrderBook>,
+    idempotency: std::collections::HashMap<String, OrderAck>,
+}
+
+type Shared = Arc<RwLock<State>>;
+
+#[tokio::main]
+async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).compact().init();
+
+    let state: Shared = Arc::new(RwLock::new(State::default()));
+    let app = Router::new()
+        .route("/healthz", get(|| async { (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))) }))
+        .route("/v1/orders", post(place_order))
+        .with_state(state);
+
+    let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8083);
+    let addr = SocketAddr::from(([0,0,0,0], port));
+    info!("exchange-engine listening on {}", addr);
+    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+}
+
+async fn place_order(
+    axum::extract::State(state): axum::extract::State<Shared>,
+    Json(req): Json<OrderRequest>,
+) -> (StatusCode, Json<OrderAck>) {
+    let mut s = state.write().unwrap();
+
+    if let Some(ack) = s.idempotency.get(&req.idempotency_key) {
+        return (StatusCode::OK, Json(ack.clone()));
+    }
+
+    let book = s.books.entry(req.symbol.clone()).or_default();
+    let mut status = "accepted";
+
+    match req.side {
+        Side::Buy => {
+            let mut to_match = req.qty;
+            let mut removals = vec![];
+            for (price, level) in book.asks.iter_mut() {
+                if *price > req.price || to_match == 0 { break; }
+                let take = to_match.min(level.qty);
+                level.qty -= take;
+                to_match -= take;
+                if level.qty == 0 { removals.push(*price); }
+            }
+            for p in removals { book.asks.remove(&p); }
+            if to_match > 0 {
+                let level = book.bids.entry(req.price).or_default();
+                level.qty += to_match;
+                status = if to_match == req.qty { "accepted" } else { "partial" };
+            } else {
+                status = "filled";
+            }
+        }
+        Side::Sell => {
+            let mut to_match = req.qty;
+            let mut removals = vec![];
+            for (price, level) in book.bids.iter_mut().rev() {
+                if *price < req.price || to_match == 0 { break; }
+                let take = to_match.min(level.qty);
+                level.qty -= take;
+                to_match -= take;
+                if level.qty == 0 { removals.push(*price); }
+            }
+            for p in removals { book.bids.remove(&p); }
+            if to_match > 0 {
+                let level = book.asks.entry(req.price).or_default();
+                level.qty += to_match;
+                status = if to_match == req.qty { "accepted" } else { "partial" };
+            } else {
+                status = "filled";
+            }
+        }
+    }
+
+    let ack = OrderAck { order_id: Uuid::new_v4(), status: status.into() };
+    s.idempotency.insert(req.idempotency_key, ack.clone());
+    (StatusCode::OK, Json(ack))
+}
