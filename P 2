@@ -1,0 +1,126 @@
+use axum::{extract::Path, routing::get, routing::post, Json, Router, http::StatusCode};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, net::SocketAddr, sync::{Arc, RwLock}};
+use tracing::{info};
+use tracing_subscriber::{fmt, EnvFilter};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Account {
+    id: String,       // external id (e.g., user or system)
+    currency: String, // e.g., "USD" or "HORIZ"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PostingRequest {
+    idempotency_key: String,
+    from_account: String,
+    to_account: String,
+    currency: String,
+    amount: i64, // minor units for fiat (cents); integer base units for crypto
+    reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PostingResult {
+    posting_id: Uuid,
+    ledger_ts_ms: i64,
+    balances: HashMap<String, i64>, // quick feedback (optional)
+}
+
+#[derive(Default)]
+struct State {
+    balances: HashMap<(String, String), i64>,          // (account,currency) -> balance
+    idempotency: HashMap<String, PostingResult>,       // idem key -> result
+    accounts: HashMap<String, Account>,                // account registry
+}
+
+type Shared = Arc<RwLock<State>>;
+
+#[tokio::main]
+async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).compact().init();
+
+    let state: Shared = Arc::new(RwLock::new(State::default()));
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))) }))
+        .route("/v1/accounts", post(create_account))
+        .route("/v1/balances/:account/:currency", get(get_balance))
+        .route("/v1/postings", post(posting))
+        .with_state(state);
+
+    let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
+    let addr = SocketAddr::from(([0,0,0,0], port));
+    info!("ledger listening on {}", addr);
+    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+}
+
+async fn create_account(
+    axum::extract::State(state): axum::extract::State<Shared>,
+    Json(req): Json<Account>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut s = state.write().unwrap();
+    s.accounts.insert(req.id.clone(), req.clone());
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+}
+
+async fn get_balance(
+    axum::extract::State(state): axum::extract::State<Shared>,
+    Path((account, currency)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let s = state.read().unwrap();
+    let bal = *s.balances.get(&(account.clone(), currency.clone())).unwrap_or(&0);
+    (StatusCode::OK, Json(serde_json::json!({ "account": account, "currency": currency, "balance": bal })))
+}
+
+fn now_ms() -> i64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()) as i64
+}
+
+async fn posting(
+    axum::extract::State(state): axum::extract::State<Shared>,
+    Json(req): Json<PostingRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut s = state.write().unwrap();
+
+    if let Some(existing) = s.idempotency.get(&req.idempotency_key) {
+        return (StatusCode::OK, Json(serde_json::json!({"idempotent": true, "result": existing})));
+    }
+
+    if !s.accounts.contains_key(&req.from_account) || !s.accounts.contains_key(&req.to_account) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"unknown_account"})));
+    }
+    if req.amount <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"amount_must_be_positive"})));
+    }
+
+    let k_from = (req.from_account.clone(), req.currency.clone());
+    let k_to = (req.to_account.clone(), req.currency.clone());
+    let from_bal = s.balances.get(&k_from).cloned().unwrap_or(0);
+
+    if from_bal < req.amount {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"insufficient_funds"})));
+    }
+
+    let new_from = from_bal - req.amount;
+    let new_to = s.balances.get(&k_to).cloned().unwrap_or(0) + req.amount;
+    s.balances.insert(k_from, new_from);
+    s.balances.insert(k_to, new_to);
+
+    let result = PostingResult {
+        posting_id: Uuid::new_v4(),
+        ledger_ts_ms: now_ms(),
+        balances: HashMap::from([
+            (req.from_account.clone(), new_from),
+            (req.to_account.clone(), new_to),
+        ]),
+    };
+    s.idempotency.insert(req.idempotency_key.clone(), result.clone());
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "result": result, "reference": req.reference})))
+}
